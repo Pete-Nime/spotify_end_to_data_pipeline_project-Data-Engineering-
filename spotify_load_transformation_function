@@ -1,0 +1,131 @@
+import json
+import boto3
+from datetime import datetime
+from io import StringIO
+import pandas as pd
+
+# -----------------------
+# FUNCTIONS TO PARSE JSON
+# -----------------------
+
+def album(data):
+    album_list = []
+    for row in data.get('items', []):
+        album_info = row['track']['album']
+        album_element = {
+            'album_id': album_info['id'],
+            'name': album_info['name'],
+            'release_date': album_info['release_date'],
+            'total_tracks': album_info['total_tracks'],
+            'url': album_info['external_urls']['spotify']
+        }
+        album_list.append(album_element)
+    return album_list
+
+def artist(data):
+    artist_list = []
+    for row in data.get('items', []):
+        track_artists = row['track'].get('artists', [])
+        for artist in track_artists:
+            artist_dict = {
+                'artist_id': artist['id'],
+                'artist_name': artist['name'],
+                'external_url': artist['href']
+            }
+            artist_list.append(artist_dict)
+    return artist_list
+
+def song(data):
+    song_list = []
+    for row in data.get('items', []):
+        track = row['track']
+        song_element = {
+            'song_id': track['id'],
+            'song_name': track['name'],
+            'duration_ms': track['duration_ms'],
+            'url': track['external_urls']['spotify'],
+            'popularity': track['popularity'],
+            'song_added': row['added_at'],
+            'album_id': track['album']['id'],
+            'artist_id': track['album']['artists'][0]['id']
+        }
+        song_list.append(song_element)
+    return song_list
+
+# -----------------------
+# LAMBDA HANDLER
+# -----------------------
+
+def lambda_handler(event, context):
+    s3 = boto3.client('s3')
+    bucket = 'spotify-etl-project-pete'
+    key_prefix = 'raw_data/processed/'
+
+    # Get list of JSON files from S3
+    response = s3.list_objects(Bucket=bucket, Prefix=key_prefix)
+    spotify_data = []
+    spotify_keys = []
+
+    for file in response.get('Contents', []):
+        file_key = file['Key']
+        if file_key.endswith('.json'):
+            spotify_keys.append(file_key)
+            s3_obj = s3.get_object(Bucket=bucket, Key=file_key)
+            content = s3_obj['Body'].read()
+            jsonObject = json.loads(content)
+            spotify_data.append(jsonObject)
+
+    # Process each JSON file
+    for data in spotify_data:
+        album_list = album(data)
+        artist_list = artist(data)
+        song_list = song(data)
+
+        album_df = pd.DataFrame(album_list).drop_duplicates(subset=['album_id'])
+        artist_df = pd.DataFrame(artist_list).drop_duplicates(subset=['artist_id'])
+        song_df = pd.DataFrame(song_list)
+
+        # Convert date columns properly
+        album_df['release_date'] = pd.to_datetime(album_df['release_date'], errors='coerce')
+        song_df['song_added'] = pd.to_datetime(song_df['song_added'], errors='coerce')
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Save song data
+        song_key = f'transform_data/album_data/song_transformed_{timestamp}.csv'
+        song_buffer = StringIO()
+        song_df.to_csv(song_buffer, index=False)
+        song_content = song_buffer.getvalue()
+        s3.put_object(Bucket=bucket, Key=song_key, Body=song_content)
+
+        # Save album data
+        album_key = f'transform_data/album_data/album_transformed_{timestamp}.csv'
+        album_buffer = StringIO()
+        album_df.to_csv(album_buffer, index=False)
+        album_content = album_buffer.getvalue()
+        s3.put_object(Bucket=bucket, Key=album_key, Body=album_content)
+
+        # Save artist data
+        artist_key = f'transform_data/artist_data/artist_transformed_{timestamp}.csv'
+        artist_buffer = StringIO()
+        artist_df.to_csv(artist_buffer, index=False)
+        artist_content = artist_buffer.getvalue()
+        s3.put_object(Bucket=bucket, Key=artist_key, Body=artist_content)
+
+    # Move processed files to to_processed
+    s3_resource = boto3.resource('s3')
+
+    for key in spotify_keys:
+        copy_source = {
+            'Bucket': bucket,
+            'Key': key
+        }
+
+        s3_resource.meta.client.copy(
+            copy_source,
+            bucket,
+            'raw_data/to_processed/' + key.split('/')[-1]
+        )
+
+        # Delete original file
+        s3_resource.Object(bucket, key).delete()
